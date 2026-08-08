@@ -1,0 +1,30 @@
+name: Daily Stock Recommender
+
+on:
+  schedule:
+    - cron: '30 3 * * 1-5'  # 9:00 AM IST (UTC+5:30)
+  workflow_dispatch:  # Manual trigger bhi kar sakte hain
+
+jobs:
+  recommend:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        pip install yfinance feedparser pandas numpy requests
+
+    - name: Run stock recommender
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: |
+        python stock_recommender.py
