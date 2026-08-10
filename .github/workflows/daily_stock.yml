@@ -2,8 +2,8 @@ name: Daily Stock Recommender
 
 on:
   schedule:
-    - cron: '30 3 * * 1-5'  # 9:00 AM IST (UTC+5:30)
-  workflow_dispatch:  # Manual trigger bhi kar sakte hain
+    - cron: '46 16 * * *'
+  workflow_dispatch:
 
 jobs:
   recommend:
