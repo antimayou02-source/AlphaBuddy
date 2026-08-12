@@ -2,7 +2,8 @@ name: Daily Stock Recommender
 
 on:
   schedule:
-    - cron: '30 21 * * 0-4'
+    - cron: '0 3 * * 1-5'
+
   workflow_dispatch:
 
 jobs:
