@@ -58,6 +58,12 @@ VIX_CAUTION     = 15   # Warn but allow
 MIN_RR_INTRADAY = 2.0
 MIN_RR_LONGTERM = 2.5
 
+# Intraday settings
+INTRADAY_INTERVAL = "5m"
+INTRADAY_PERIOD = "5d"
+INTRADAY_START_MINUTES = 15   # wait for first 15 minutes / opening range
+INTRADAY_MIN_BARS = 25
+
 # Blacklisted tickers — high beta, too volatile, unreliable
 BLACKLIST = {
     "SAIL.NS","RPOWER.NS","JPPOWER.NS","YESBANK.NS","SUZLON.NS",
@@ -469,6 +475,197 @@ def score_longterm(df, row, info):
     return score, confirmations, reasons
 
 
+def fetch_intraday_data(ticker):
+    """
+    Fetch recent 5-minute candles for genuine intraday analysis.
+    yfinance intraday data is separate from the daily 1y data used
+    for long-term indicators.
+    """
+    try:
+        intraday = yf.Ticker(ticker).history(
+            period=INTRADAY_PERIOD,
+            interval=INTRADAY_INTERVAL,
+            auto_adjust=False,
+            prepost=False,
+        )
+        if intraday is None or intraday.empty:
+            return None
+
+        intraday = intraday.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+
+        # Work only with regular NSE session candles.
+        if getattr(intraday.index, "tz", None) is not None:
+            intraday.index = intraday.index.tz_convert("Asia/Kolkata")
+
+        intraday = intraday[
+            (intraday.index.hour > 9) |
+            ((intraday.index.hour == 9) & (intraday.index.minute >= 15))
+        ]
+        intraday = intraday[
+            (intraday.index.hour < 15) |
+            ((intraday.index.hour == 15) & (intraday.index.minute <= 15))
+        ]
+
+        if len(intraday) < INTRADAY_MIN_BARS:
+            return None
+
+        return intraday
+    except Exception as e:
+        print(f"  ! {ticker} intraday data: {e}")
+        return None
+
+
+def compute_intraday_indicators(df):
+    """Compute indicators from 5-minute candles, not daily candles."""
+    df = df.copy()
+
+    # Short intraday trend
+    df["EMA9"] = df["Close"].ewm(span=9, adjust=False).mean()
+    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
+
+    # RSI(14) on 5-minute candles
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    df["RSI"] = (100 - 100 / (1 + rs)).fillna(50)
+
+    # MACD on 5-minute candles
+    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema12 - ema26
+    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+
+    # True Range / ATR(14) on 5-minute candles
+    hl = df["High"] - df["Low"]
+    hc = (df["High"] - df["Close"].shift()).abs()
+    lc = (df["Low"] - df["Close"].shift()).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    df["ATR"] = tr.ewm(alpha=1/14, adjust=False).mean()
+
+    # True intraday VWAP: reset at each trading day.
+    typical = (df["High"] + df["Low"] + df["Close"]) / 3
+    session = df.index.date
+    df["_TPV"] = typical * df["Volume"]
+    df["_CumVol"] = df["Volume"].groupby(session).cumsum()
+    df["_CumTPV"] = df["_TPV"].groupby(session).cumsum()
+    df["VWAP"] = df["_CumTPV"] / df["_CumVol"].replace(0, np.nan)
+
+    # Relative volume: current 5-minute bar vs its own recent 5-minute bars.
+    df["AvgVol20"] = df["Volume"].rolling(20, min_periods=5).mean()
+    df["RelVolume"] = df["Volume"] / df["AvgVol20"].replace(0, np.nan)
+
+    # Opening range = first 15 minutes of the current session.
+    latest_date = df.index[-1].date()
+    today = df[df.index.date == latest_date]
+    opening = today.between_time("09:15", "09:30", inclusive="left")
+    if not opening.empty:
+        opening_high = opening["High"].max()
+        opening_low = opening["Low"].min()
+        df["OpeningHigh"] = opening_high
+        df["OpeningLow"] = opening_low
+    else:
+        df["OpeningHigh"] = np.nan
+        df["OpeningLow"] = np.nan
+
+    return df
+
+
+def score_intraday_5m(df, ctx):
+    """
+    Score a long intraday setup using actual 5-minute market data.
+    Returns score, confirmations, reasons.
+    """
+    if df is None or df.empty:
+        return 0, 0, ["No intraday data"]
+
+    row = df.iloc[-1]
+    score, confirmations, reasons = 0, 0, []
+
+    if ctx.get("skip_intraday"):
+        return 0, 0, ["VIX too high — intraday skipped"]
+
+    price = float(row["Close"])
+    vwap = row.get("VWAP")
+    relvol = row.get("RelVolume")
+    rsi = row.get("RSI")
+    atr = row.get("ATR")
+    ema9 = row.get("EMA9")
+    ema20 = row.get("EMA20")
+    opening_high = row.get("OpeningHigh")
+
+    # 1. Market context
+    if ctx.get("nifty_trend") == "bearish":
+        score -= 12
+        reasons.append("Nifty weak — long intraday trades need extra confirmation")
+    elif ctx.get("nifty_trend") == "bullish":
+        score += 8
+        confirmations += 1
+        reasons.append("Nifty bullish — market supports long trades")
+
+    # 2. Price vs real session VWAP
+    if pd.notna(vwap) and price > vwap:
+        score += 20
+        confirmations += 1
+        reasons.append(f"Price above intraday VWAP ({vwap:.2f})")
+    elif pd.notna(vwap):
+        score -= 15
+        reasons.append("Price below intraday VWAP")
+
+    # 3. EMA trend
+    if pd.notna(ema9) and pd.notna(ema20) and ema9 > ema20 and price > ema9:
+        score += 15
+        confirmations += 1
+        reasons.append("5-min EMA9 > EMA20 and price above EMA9")
+    elif pd.notna(ema9) and pd.notna(ema20) and ema9 < ema20:
+        score -= 10
+        reasons.append("5-min EMA trend bearish")
+
+    # 4. Relative volume
+    if pd.notna(relvol) and relvol >= 1.5:
+        score += 20
+        confirmations += 1
+        reasons.append(f"Relative 5-min volume {relvol:.1f}x")
+    elif pd.notna(relvol) and relvol >= 1.2:
+        score += 10
+        confirmations += 1
+        reasons.append(f"Above-average 5-min volume {relvol:.1f}x")
+    else:
+        score -= 8
+        reasons.append("Weak intraday volume")
+
+    # 5. RSI
+    if pd.notna(rsi) and 50 <= rsi <= 68:
+        score += 15
+        confirmations += 1
+        reasons.append(f"5-min RSI {rsi:.0f} — bullish momentum zone")
+    elif pd.notna(rsi) and 40 <= rsi < 50:
+        score += 5
+    elif pd.notna(rsi) and rsi > 72:
+        score -= 12
+        reasons.append(f"5-min RSI {rsi:.0f} — overextended")
+
+    # 6. Opening-range breakout
+    if pd.notna(opening_high) and price > opening_high:
+        score += 20
+        confirmations += 1
+        reasons.append("Breakout above first 15-minute high")
+    elif pd.notna(opening_high):
+        reasons.append("No opening-range breakout yet")
+
+    # 7. ATR: enough movement, but avoid extreme volatility
+    atr_pct = (atr / price * 100) if pd.notna(atr) and price else 0
+    if 0.15 <= atr_pct <= 1.0:
+        score += 8
+        confirmations += 1
+        reasons.append(f"5-min ATR {atr_pct:.2f}% — tradable range")
+    elif atr_pct > 1.5:
+        score -= 10
+        reasons.append(f"5-min ATR {atr_pct:.2f}% — too volatile")
+
+    return score, confirmations, reasons
+
+
 def score_intraday(df, row, ctx):
     score, confirmations, reasons = 0, 0, []
     price = row["Close"]
@@ -618,22 +815,33 @@ def fetch_and_score(tickers, ctx):
                         "buy_high": round(price * 1.005, 2),
                     })
 
-            # Intraday
+            # Intraday — use actual 5-minute candles, not the daily dataframe.
             if not ctx.get("skip_intraday") and sector_ok:
-                in_score, in_conf, in_reasons = score_intraday(df, row, ctx)
-                if in_score >= 55 and in_conf >= MIN_INTRA_CONFIRMATIONS:
-                    sl  = round(price - 0.7 * atr, 2)
-                    tgt = round(price + MIN_RR_INTRADAY * (price - sl), 2)
-                    rr  = round((tgt - price) / (price - sl), 1)
-                    if rr >= MIN_RR_INTRADAY:
-                        intra_candidates.append({
-                            "ticker": ticker, "name": name, "price": price,
-                            "score": in_score, "confirmations": in_conf,
-                            "reasons": in_reasons, "rr": rr,
-                            "stop_loss": sl, "target": tgt,
-                            "buy_low":  round(price * 0.997, 2),
-                            "buy_high": round(price * 1.003, 2),
-                        })
+                intra_df = fetch_intraday_data(ticker)
+                if intra_df is not None:
+                    intra_df = compute_intraday_indicators(intra_df)
+                    in_score, in_conf, in_reasons = score_intraday_5m(intra_df, ctx)
+
+                    if in_score >= 70 and in_conf >= MIN_INTRA_CONFIRMATIONS:
+                        intra_row = intra_df.iloc[-1]
+                        intra_price = float(intra_row["Close"])
+                        intra_atr = float(intra_row["ATR"]) if pd.notna(intra_row["ATR"]) else intra_price * 0.005
+
+                        # Intraday stop based on 5-minute ATR.
+                        sl = round(intra_price - 1.0 * intra_atr, 2)
+                        risk = intra_price - sl
+                        tgt = round(intra_price + MIN_RR_INTRADAY * risk, 2)
+                        rr = round((tgt - intra_price) / risk, 1) if risk > 0 else 0
+
+                        if rr >= MIN_RR_INTRADAY and sl < intra_price:
+                            intra_candidates.append({
+                                "ticker": ticker, "name": name, "price": round(intra_price, 2),
+                                "score": in_score, "confirmations": in_conf,
+                                "reasons": in_reasons, "rr": rr,
+                                "stop_loss": sl, "target": tgt,
+                                "buy_low": round(intra_price * 0.999, 2),
+                                "buy_high": round(intra_price * 1.002, 2),
+                            })
 
         except Exception as e:
             print(f"  ! {ticker}: {e}")
@@ -717,7 +925,7 @@ def build_telegram_messages(lt_picks, intra_picks, ctx):
             f"Focus only on long-term today."
         )
     else:
-        messages.append("INTRADAY PICKS (Exit before 3:15 PM)")
+        messages.append("INTRADAY PICKS (5-min confirmation | Exit before 3:15 PM)")
         if not intra_picks:
             messages.append(
                 "No high-probability intraday setups today.\n"
