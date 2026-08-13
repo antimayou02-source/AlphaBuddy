@@ -2,8 +2,8 @@ name: Daily Stock Recommender
 
 on:
   schedule:
-  - cron: '35 9 * * 1-5'
-      timezone: 'Asia/Kolkata'
+    - cron: '5 4 * * 1-5'
+
   workflow_dispatch:
 
 
