@@ -23,6 +23,7 @@ SETUP
 
 import os, sys, time, random
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import numpy as np
@@ -48,7 +49,7 @@ OUTPUT_FILE        = f"recommendations_{datetime.now():%Y-%m-%d}.md"
 
 # Strict confirmation requirements
 MIN_LT_CONFIRMATIONS    = 4
-MIN_INTRA_CONFIRMATIONS = 5
+MIN_INTRA_CONFIRMATIONS = 6
 
 # VIX thresholds
 VIX_NO_INTRADAY = 18   # Skip intraday completely
@@ -63,6 +64,11 @@ INTRADAY_INTERVAL = "5m"
 INTRADAY_PERIOD = "5d"
 INTRADAY_START_MINUTES = 15   # wait for first 15 minutes / opening range
 INTRADAY_MIN_BARS = 25
+INTRADAY_START_TIME = "09:35"
+INTRADAY_CUTOFF_TIME = "11:30"
+INTRADAY_MIN_TARGET_PCT = 0.50
+INTRADAY_MAX_RISK_PCT = 0.75
+INTRADAY_SL_ATR_MULT = 1.5
 
 # Blacklisted tickers — high beta, too volatile, unreliable
 BLACKLIST = {
@@ -475,6 +481,14 @@ def score_longterm(df, row, info):
     return score, confirmations, reasons
 
 
+def intraday_window_status():
+    """Return whether new intraday trades are allowed, using India time."""
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    start = now.replace(hour=9, minute=35, second=0, microsecond=0)
+    cutoff = now.replace(hour=11, minute=30, second=0, microsecond=0)
+    return start <= now <= cutoff, now
+
+
 def fetch_intraday_data(ticker):
     """
     Fetch recent 5-minute candles for genuine intraday analysis.
@@ -572,18 +586,15 @@ def compute_intraday_indicators(df):
 
 
 def score_intraday_5m(df, ctx):
-    """
-    Score a long intraday setup using actual 5-minute market data.
-    Returns score, confirmations, reasons.
-    """
+    """Score a conservative long intraday setup using actual 5-minute candles."""
     if df is None or df.empty:
         return 0, 0, ["No intraday data"]
 
+    if ctx.get("skip_intraday"):
+        return 0, 0, ["Intraday skipped by market/risk filter"]
+
     row = df.iloc[-1]
     score, confirmations, reasons = 0, 0, []
-
-    if ctx.get("skip_intraday"):
-        return 0, 0, ["VIX too high — intraday skipped"]
 
     price = float(row["Close"])
     vwap = row.get("VWAP")
@@ -594,174 +605,69 @@ def score_intraday_5m(df, ctx):
     ema20 = row.get("EMA20")
     opening_high = row.get("OpeningHigh")
 
-    # 1. Market context
-    if ctx.get("nifty_trend") == "bearish":
-        score -= 12
-        reasons.append("Nifty weak — long intraday trades need extra confirmation")
-    elif ctx.get("nifty_trend") == "bullish":
-        score += 8
+    # Market confirmation: bearish Nifty is a hard reject upstream; bullish is a bonus.
+    if ctx.get("nifty_trend") == "bullish":
+        score += 12
         confirmations += 1
         reasons.append("Nifty bullish — market supports long trades")
+    elif ctx.get("nifty_trend") == "neutral":
+        score += 2
+        reasons.append("Nifty neutral — stock must prove strength")
+    else:
+        return 0, 0, ["Nifty bearish — long intraday trade rejected"]
 
-    # 2. Price vs real session VWAP
+    # 1. Price vs session VWAP
     if pd.notna(vwap) and price > vwap:
-        score += 20
+        score += 18
         confirmations += 1
         reasons.append(f"Price above intraday VWAP ({vwap:.2f})")
-    elif pd.notna(vwap):
-        score -= 15
-        reasons.append("Price below intraday VWAP")
+    else:
+        return 0, 0, ["Price not above intraday VWAP"]
 
-    # 3. EMA trend
+    # 2. Short-term trend
     if pd.notna(ema9) and pd.notna(ema20) and ema9 > ema20 and price > ema9:
-        score += 15
+        score += 16
         confirmations += 1
         reasons.append("5-min EMA9 > EMA20 and price above EMA9")
-    elif pd.notna(ema9) and pd.notna(ema20) and ema9 < ema20:
-        score -= 10
-        reasons.append("5-min EMA trend bearish")
+    else:
+        return 0, 0, ["5-min trend not bullish"]
 
-    # 4. Relative volume
+    # 3. Relative volume — require genuine participation
     if pd.notna(relvol) and relvol >= 1.5:
-        score += 20
+        score += 18
         confirmations += 1
         reasons.append(f"Relative 5-min volume {relvol:.1f}x")
-    elif pd.notna(relvol) and relvol >= 1.2:
-        score += 10
-        confirmations += 1
-        reasons.append(f"Above-average 5-min volume {relvol:.1f}x")
     else:
-        score -= 8
-        reasons.append("Weak intraday volume")
+        return 0, 0, ["Relative volume below 1.5x"]
 
-    # 5. RSI
+    # 4. RSI — avoid chasing overbought candles
     if pd.notna(rsi) and 50 <= rsi <= 68:
-        score += 15
+        score += 14
         confirmations += 1
         reasons.append(f"5-min RSI {rsi:.0f} — bullish momentum zone")
-    elif pd.notna(rsi) and 40 <= rsi < 50:
-        score += 5
-    elif pd.notna(rsi) and rsi > 72:
-        score -= 12
-        reasons.append(f"5-min RSI {rsi:.0f} — overextended")
+    elif pd.notna(rsi) and rsi > 68:
+        return 0, 0, [f"5-min RSI {rsi:.0f} — too extended"]
+    else:
+        return 0, 0, ["5-min RSI lacks bullish confirmation"]
 
-    # 6. Opening-range breakout
+    # 5. Opening-range breakout
     if pd.notna(opening_high) and price > opening_high:
-        score += 20
+        score += 18
         confirmations += 1
         reasons.append("Breakout above first 15-minute high")
-    elif pd.notna(opening_high):
-        reasons.append("No opening-range breakout yet")
+    else:
+        return 0, 0, ["No first-15-minute breakout"]
 
-    # 7. ATR: enough movement, but avoid extreme volatility
+    # 6. Tradable 5-minute volatility
     atr_pct = (atr / price * 100) if pd.notna(atr) and price else 0
-    if 0.15 <= atr_pct <= 1.0:
-        score += 8
+    if 0.15 <= atr_pct <= 0.75:
+        score += 10
         confirmations += 1
         reasons.append(f"5-min ATR {atr_pct:.2f}% — tradable range")
-    elif atr_pct > 1.5:
-        score -= 10
-        reasons.append(f"5-min ATR {atr_pct:.2f}% — too volatile")
-
-    return score, confirmations, reasons
-
-
-def score_intraday(df, row, ctx):
-    score, confirmations, reasons = 0, 0, []
-    price = row["Close"]
-
-    # Hard blocks
-    if ctx.get("skip_intraday"):
-        return 0, 0, ["VIX too high — intraday skipped"]
-
-    if check_already_pumped(df):
-        return 0, 0, ["Already up >2% — avoid chasing"]
-
-    if not check_3day_positive(df):
-        score -= 15
-        reasons.append("Weak 3-day momentum — risky intraday")
-
-    if ctx.get("nifty_trend") == "bearish":
-        score -= 10
-        reasons.append("Nifty weak — intraday risky")
-
-    if ctx.get("us_trend") == "bearish":
-        score -= 8
-        reasons.append("US markets weak — cautious today")
-
-    # 1. Volume
-    vol_ratio = row["Volume"] / row["AvgVol20"] if row["AvgVol20"] else 1
-    if vol_ratio > 1.5:
-        score += 22; confirmations += 1
-        reasons.append(f"High volume {vol_ratio:.1f}x — strong interest")
-    elif vol_ratio > 1.2:
-        score += 10; confirmations += 1
-        reasons.append(f"Above avg volume {vol_ratio:.1f}x")
+    elif atr_pct > 0.75:
+        return 0, 0, [f"5-min ATR {atr_pct:.2f}% — too volatile"]
     else:
-        score -= 10  # Low volume = avoid intraday
-
-    # 2. VWAP
-    if pd.notna(row["VWAP"]) and price > row["VWAP"]:
-        score += 18; confirmations += 1
-        reasons.append("Price above VWAP — buyers in control")
-    elif pd.notna(row["VWAP"]) and price < row["VWAP"]:
-        score -= 10
-
-    # 3. MACD
-    if pd.notna(row["MACD"]) and row["MACD"] > row["MACD_Signal"]:
-        score += 15; confirmations += 1
-        reasons.append("MACD bullish — momentum building")
-
-    # 4. RSI
-    if 45 <= row["RSI"] <= 62:
-        score += 15; confirmations += 1
-        reasons.append(f"RSI {row['RSI']:.0f} — ideal intraday zone")
-    elif row["RSI"] < 35:
-        score += 8; confirmations += 1
-        reasons.append(f"RSI {row['RSI']:.0f} — oversold bounce")
-    elif row["RSI"] > 70:
-        score -= 15
-        reasons.append(f"RSI {row['RSI']:.0f} — overbought, AVOID")
-
-    # 5. ADX
-    if pd.notna(row["ADX"]) and row["ADX"] > 20:
-        score += 10; confirmations += 1
-        reasons.append(f"ADX {row['ADX']:.0f} — trending")
-    elif pd.notna(row["ADX"]) and row["ADX"] < 15:
-        score -= 10
-
-    # 6. Supertrend
-    if pd.notna(row["Supertrend_dir"]) and row["Supertrend_dir"] == 1:
-        score += 10; confirmations += 1
-        reasons.append("Supertrend bullish")
-    elif pd.notna(row["Supertrend_dir"]) and row["Supertrend_dir"] == -1:
-        score -= 15
-
-    # 7. Stochastic
-    if pd.notna(row["Stoch_K"]) and 20 <= row["Stoch_K"] <= 65:
-        score += 8; confirmations += 1
-        reasons.append(f"Stochastic {row['Stoch_K']:.0f} — good entry")
-    elif pd.notna(row["Stoch_K"]) and row["Stoch_K"] > 80:
-        score -= 10
-
-    # 8. ATR range
-    atr_pct = (row["ATR"] / price * 100) if pd.notna(row["ATR"]) and price else 0
-    if 0.8 <= atr_pct <= 2.5:
-        score += 8; confirmations += 1
-        reasons.append(f"ATR {atr_pct:.1f}% — good intraday range")
-    elif atr_pct > 4:
-        score -= 10
-        reasons.append(f"ATR {atr_pct:.1f}% — too volatile")
-
-    # 9. Bollinger Band
-    if pd.notna(row["BB_lower"]) and price <= row["BB_lower"] * 1.015:
-        score += 8; confirmations += 1
-        reasons.append("Near lower Bollinger Band — bounce likely")
-
-    # 10. DMA20
-    if pd.notna(row["DMA20"]) and price > row["DMA20"]:
-        score += 8; confirmations += 1
-        reasons.append("Price above 20DMA — short-term uptrend")
+        return 0, 0, [f"5-min ATR {atr_pct:.2f}% — too small for intraday"]
 
     return score, confirmations, reasons
 
@@ -815,25 +721,38 @@ def fetch_and_score(tickers, ctx):
                         "buy_high": round(price * 1.005, 2),
                     })
 
-            # Intraday — use actual 5-minute candles, not the daily dataframe.
+            # Intraday — only during the approved morning window, using actual 5-minute candles.
             if not ctx.get("skip_intraday") and sector_ok:
                 intra_df = fetch_intraday_data(ticker)
                 if intra_df is not None:
                     intra_df = compute_intraday_indicators(intra_df)
                     in_score, in_conf, in_reasons = score_intraday_5m(intra_df, ctx)
 
-                    if in_score >= 70 and in_conf >= MIN_INTRA_CONFIRMATIONS:
+                    if in_score >= 82 and in_conf >= MIN_INTRA_CONFIRMATIONS:
                         intra_row = intra_df.iloc[-1]
                         intra_price = float(intra_row["Close"])
-                        intra_atr = float(intra_row["ATR"]) if pd.notna(intra_row["ATR"]) else intra_price * 0.005
+                        intra_atr = float(intra_row["ATR"]) if pd.notna(intra_row["ATR"]) else intra_price * 0.003
 
-                        # Intraday stop based on 5-minute ATR.
-                        sl = round(intra_price - 1.0 * intra_atr, 2)
+                        # Use both volatility and recent structure so the stop is not inside normal noise.
+                        recent = intra_df.tail(6)
+                        swing_low = float(recent["Low"].min()) if not recent.empty else intra_price
+                        atr_stop = intra_price - INTRADAY_SL_ATR_MULT * intra_atr
+                        structure_stop = swing_low * 0.999
+                        sl = round(min(atr_stop, structure_stop), 2)
+
                         risk = intra_price - sl
-                        tgt = round(intra_price + MIN_RR_INTRADAY * risk, 2)
-                        rr = round((tgt - intra_price) / risk, 1) if risk > 0 else 0
+                        risk_pct = (risk / intra_price * 100) if intra_price else 999
 
-                        if rr >= MIN_RR_INTRADAY and sl < intra_price:
+                        # Reject stops that are either unrealistically tight or too wide.
+                        if risk <= 0 or risk_pct > INTRADAY_MAX_RISK_PCT:
+                            continue
+
+                        # Minimum 0.50% target distance, while preserving at least 1:2 R:R.
+                        target_distance = max(MIN_RR_INTRADAY * risk, intra_price * INTRADAY_MIN_TARGET_PCT / 100)
+                        tgt = round(intra_price + target_distance, 2)
+                        rr = round(target_distance / risk, 1) if risk > 0 else 0
+
+                        if rr >= MIN_RR_INTRADAY and (tgt - intra_price) / intra_price * 100 >= INTRADAY_MIN_TARGET_PCT:
                             intra_candidates.append({
                                 "ticker": ticker, "name": name, "price": round(intra_price, 2),
                                 "score": in_score, "confirmations": in_conf,
@@ -1035,12 +954,21 @@ def safe_print(text):
 
 def run():
     safe_print("=" * 50)
-    safe_print(f"Daily Stock Recommender v3.0 - {datetime.now():%d %b %Y %H:%M}")
+    safe_print(f"Daily Stock Recommender v5.0 - {datetime.now():%d %b %Y %H:%M}")
     safe_print("=" * 50)
 
     safe_print("\nFetching market context...")
     ctx = get_market_context()
-    safe_print(f"VIX={ctx.get('vix','N/A')} | Nifty={ctx.get('nifty_trend')} | US={ctx.get('us_trend')}")
+    in_window, india_now = intraday_window_status()
+    if not in_window:
+        ctx["skip_intraday"] = True
+        ctx["warnings"].append(
+            f"Intraday window closed — allowed only {INTRADAY_START_TIME} to {INTRADAY_CUTOFF_TIME} IST (now {india_now:%H:%M} IST)"
+        )
+    if ctx.get("nifty_trend") == "bearish":
+        ctx["skip_intraday"] = True
+        ctx["warnings"].append("Nifty bearish — no new long intraday trades")
+    safe_print(f"VIX={ctx.get('vix','N/A')} | Nifty={ctx.get('nifty_trend')} | US={ctx.get('us_trend')} | IST={india_now:%H:%M}")
     for w in ctx.get("warnings", []):
         safe_print(f"  WARNING: {w}")
 
