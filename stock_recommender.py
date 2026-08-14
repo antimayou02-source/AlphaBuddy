@@ -245,12 +245,12 @@ def get_market_context():
 
 
 def is_sector_healthy(ticker, ctx):
-    """Return True if ticker's sector is healthy."""
+    """Return True only when the mapped sector is confirmed supportive."""
     sector = TICKER_SECTOR.get(ticker)
     if not sector:
-        return True  # Unknown sector — don't penalize
+        return False  # No sector mapping = no intraday sector confirmation
     health = ctx["sector_health"].get(sector, "unknown")
-    return health != "bearish"
+    return health in {"bullish", "neutral"}
 
 
 # ─────────────────────────── INDICATORS ────────────────────────────────────
@@ -611,8 +611,7 @@ def score_intraday_5m(df, ctx):
         confirmations += 1
         reasons.append("Nifty bullish — market supports long trades")
     elif ctx.get("nifty_trend") == "neutral":
-        score += 2
-        reasons.append("Nifty neutral — stock must prove strength")
+        return 0, 0, ["Nifty neutral — no long intraday trade without market confirmation"]
     else:
         return 0, 0, ["Nifty bearish — long intraday trade rejected"]
 
@@ -726,9 +725,17 @@ def fetch_and_score(tickers, ctx):
                 intra_df = fetch_intraday_data(ticker)
                 if intra_df is not None:
                     intra_df = compute_intraday_indicators(intra_df)
+
+                    # Never create a new intraday trade after the configured cutoff.
+                    last_ts = intra_df.index[-1]
+                    current_minutes = last_ts.hour * 60 + last_ts.minute
+                    cutoff_minutes = 11 * 60 + 30
+                    if current_minutes > cutoff_minutes:
+                        continue
+
                     in_score, in_conf, in_reasons = score_intraday_5m(intra_df, ctx)
 
-                    if in_score >= 82 and in_conf >= MIN_INTRA_CONFIRMATIONS:
+                    if in_score >= 90 and in_conf >= max(6, MIN_INTRA_CONFIRMATIONS):
                         intra_row = intra_df.iloc[-1]
                         intra_price = float(intra_row["Close"])
                         intra_atr = float(intra_row["ATR"]) if pd.notna(intra_row["ATR"]) else intra_price * 0.003
@@ -747,7 +754,7 @@ def fetch_and_score(tickers, ctx):
                         if risk <= 0 or risk_pct > INTRADAY_MAX_RISK_PCT:
                             continue
 
-                        # Minimum 0.50% target distance, while preserving at least 1:2 R:R.
+                        # Minimum 0.75% target distance, while preserving at least 1:2 R:R.
                         target_distance = max(MIN_RR_INTRADAY * risk, intra_price * INTRADAY_MIN_TARGET_PCT / 100)
                         tgt = round(intra_price + target_distance, 2)
                         rr = round(target_distance / risk, 1) if risk > 0 else 0
@@ -844,7 +851,7 @@ def build_telegram_messages(lt_picks, intra_picks, ctx):
             f"Focus only on long-term today."
         )
     else:
-        messages.append("INTRADAY PICKS (5-min confirmation | Exit before 3:15 PM)")
+        messages.append("INTRADAY PICKS (V6 | 5-min confirmation | Exit before 3:15 PM)")
         if not intra_picks:
             messages.append(
                 "No high-probability intraday setups today.\n"
@@ -954,7 +961,7 @@ def safe_print(text):
 
 def run():
     safe_print("=" * 50)
-    safe_print(f"Daily Stock Recommender v5.0 - {datetime.now():%d %b %Y %H:%M}")
+    safe_print(f"Daily Stock Recommender v6.0 - {datetime.now():%d %b %Y %H:%M}")
     safe_print("=" * 50)
 
     safe_print("\nFetching market context...")
