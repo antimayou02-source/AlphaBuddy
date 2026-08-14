@@ -2,28 +2,49 @@ name: Daily Stock Recommender
 
 on:
   schedule:
-    - cron: '5 4 * * 1-5'
+    # 8:30 AM IST = 03:00 UTC — long-term
+    - cron: '0 3 * * 1-5'
+    # 9:40 AM IST = 04:10 UTC — intraday
+    - cron: '10 4 * * 1-5'
+    # 2:00 PM IST = 08:30 UTC — IPO analyzer
+    - cron: '30 8 * * 1-5'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'PREMARKET, INTRADAY, or IPO'
+        required: false
+        default: 'PREMARKET'
+
 jobs:
   recommend:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-    - name: Install dependencies
-      run: |
-        pip install yfinance feedparser pandas numpy requests
+      - name: Install dependencies
+        run: |
+          pip install yfinance feedparser pandas numpy requests
 
-    - name: Run stock recommender
-      env:
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      run: |
-        python stock_recommender.py
+      - name: Run stock recommender
+        if: ${{ github.event_name == 'schedule' && github.event.schedule != '30 8 * * 1-5' && github.event.inputs.mode != 'IPO' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STOCK_RECOMMENDER_MODE: ${{ github.event.schedule == '0 3 * * 1-5' && 'PREMARKET' || 'INTRADAY' }}
+        run: |
+          python stock_recommender.py
+
+      - name: Run IPO analyzer
+        if: ${{ (github.event_name == 'schedule' && github.event.schedule == '30 8 * * 1-5') || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'IPO') }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python ipo_analyzer.py
