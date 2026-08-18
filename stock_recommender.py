@@ -1,5 +1,5 @@
 """
-Daily Stock Recommender — v3.0 (Maximum Accuracy)
+Daily Stock Recommender — v6.2 (Maximum Accuracy)
 ===================================================
 Screens Nifty 500 + key sector stocks every morning.
 Sends recommendations to Telegram:
@@ -45,7 +45,8 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 TELEGRAM_MSG_LIMIT = 4000
 REQUEST_PAUSE      = 0.5
-OUTPUT_FILE        = f"recommendations_{datetime.now():%Y-%m-%d}.md"
+IST = ZoneInfo("Asia/Kolkata")
+OUTPUT_FILE        = f"recommendations_{datetime.now(IST):%Y-%m-%d}.md"
 
 # Strict confirmation requirements
 MIN_LT_CONFIRMATIONS    = 4
@@ -69,6 +70,7 @@ INTRADAY_CUTOFF_TIME = "11:30"
 INTRADAY_MIN_TARGET_PCT = 0.75
 INTRADAY_MAX_RISK_PCT = 0.75
 INTRADAY_SL_ATR_MULT = 1.5
+EXECUTION_MODE = os.environ.get("STOCK_RECOMMENDER_MODE", "ALL").upper()
 
 # Blacklisted tickers — high beta, too volatile, unreliable
 BLACKLIST = {
@@ -158,7 +160,7 @@ def get_market_context():
     ctx = {
         "vix": None, "nifty_trend": "unknown",
         "us_trend": "unknown", "sgx_trend": "unknown",
-        "vix_warning": False, "skip_intraday": False,
+        "vix_warning": False, "skip_intraday": False, "skip_reason": None,
         "sector_health": {},
         "warnings": [],
     }
@@ -170,6 +172,7 @@ def get_market_context():
             ctx["vix"] = round(vix_df["Close"].iloc[-1], 2)
             if ctx["vix"] >= VIX_NO_INTRADAY:
                 ctx["skip_intraday"] = True
+                ctx["skip_reason"] = f"VIX {ctx['vix']} is elevated (>= {VIX_NO_INTRADAY})."
                 ctx["warnings"].append(f"VIX {ctx['vix']} >= {VIX_NO_INTRADAY} — intraday SKIPPED")
             elif ctx["vix"] >= VIX_CAUTION:
                 ctx["vix_warning"] = True
@@ -789,7 +792,7 @@ def fetch_and_score(tickers, ctx):
 HOLD_PERIODS_LT = ["2-3 weeks","3-4 weeks","4-6 weeks","6-8 weeks","2-3 months"]
 
 def build_telegram_messages(lt_picks, intra_picks, ctx):
-    date_str = datetime.now().strftime("%d %b %Y, %H:%M")
+    date_str = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
     messages = []
 
     vix_str   = f"VIX: {ctx['vix']}" if ctx.get("vix") else "VIX: N/A"
@@ -842,13 +845,18 @@ def build_telegram_messages(lt_picks, intra_picks, ctx):
         )
 
     # Intraday
-    if ctx.get("skip_intraday"):
+    if EXECUTION_MODE == "PREMARKET":
         messages.append(
-            f"INTRADAY PICKS\n"
-            f"SKIPPED TODAY\n"
-            f"Reason: VIX {ctx.get('vix')} is too high.\n"
-            f"High volatility = high risk of stop-loss hits.\n"
-            f"Focus only on long-term today."
+            "INTRADAY PICKS\n"
+            "NOT RUN — PREMARKET MODE\n"
+            "Intraday scan starts at 09:35 IST."
+        )
+    elif ctx.get("skip_intraday"):
+        reason = ctx.get("skip_reason") or "Intraday conditions did not permit a new long trade."
+        messages.append(
+            "INTRADAY PICKS\n"
+            "SKIPPED TODAY\n"
+            f"Reason: {reason}"
         )
     else:
         messages.append("INTRADAY PICKS (V6 | 5-min confirmation | Exit before 3:15 PM)")
@@ -916,7 +924,7 @@ def send_telegram(messages):
 # ─────────────────────────── REPORT ────────────────────────────────────────
 
 def write_report(lt_picks, intra_picks, ctx):
-    date_str = datetime.now().strftime("%d %b %Y, %H:%M")
+    date_str = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
     lines = [
         f"# Daily Recommendations - {date_str}",
         f"VIX: {ctx.get('vix','N/A')} | "
@@ -946,6 +954,8 @@ def write_report(lt_picks, intra_picks, ctx):
         )
     if not intra_picks:
         lines.append("_No high-prob intraday setups today._\n")
+    if not lt_picks and not intra_picks:
+        lines.append("\n## Final Status\nNO TRADE TODAY — no setup met the current filters.")
     lines += ["\n---", "_Algorithmic screening. Not SEBI advice. Use stop-losses._"]
     Path(OUTPUT_FILE).write_text("\n".join(lines), encoding="utf-8")
 
@@ -961,30 +971,62 @@ def safe_print(text):
 
 def run():
     safe_print("=" * 50)
-    safe_print(f"Daily Stock Recommender v6.0 - {datetime.now():%d %b %Y %H:%M}")
+    safe_print(f"Daily Stock Recommender v6.2 - {datetime.now(IST):%d %b %Y %I:%M %p IST}")
+    safe_print(f"Execution mode: {EXECUTION_MODE}")
     safe_print("=" * 50)
 
     safe_print("\nFetching market context...")
     ctx = get_market_context()
     in_window, india_now = intraday_window_status()
-    if not in_window:
+
+    if EXECUTION_MODE == "PREMARKET":
         ctx["skip_intraday"] = True
-        ctx["warnings"].append(
-            f"Intraday window closed — allowed only {INTRADAY_START_TIME} to {INTRADAY_CUTOFF_TIME} IST (now {india_now:%H:%M} IST)"
-        )
-    if ctx.get("nifty_trend") == "bearish":
-        ctx["skip_intraday"] = True
-        ctx["warnings"].append("Nifty bearish — no new long intraday trades")
-    safe_print(f"VIX={ctx.get('vix','N/A')} | Nifty={ctx.get('nifty_trend')} | US={ctx.get('us_trend')} | IST={india_now:%H:%M}")
+        ctx["skip_reason"] = "PREMARKET mode — intraday scan starts at 09:35 IST."
+        ctx["warnings"].append(ctx["skip_reason"])
+
+    elif EXECUTION_MODE == "INTRADAY":
+        if not in_window:
+            ctx["skip_intraday"] = True
+            ctx["skip_reason"] = (
+                f"Outside intraday window. Allowed {INTRADAY_START_TIME}–{INTRADAY_CUTOFF_TIME} IST; "
+                f"current time is {india_now:%I:%M %p} IST."
+            )
+            ctx["warnings"].append(ctx["skip_reason"])
+        if ctx.get("nifty_trend") == "bearish":
+            ctx["skip_intraday"] = True
+            ctx["skip_reason"] = "Nifty is bearish — no new long intraday trades."
+            ctx["warnings"].append(ctx["skip_reason"])
+
+    else:
+        if not in_window:
+            ctx["skip_intraday"] = True
+            ctx["skip_reason"] = (
+                f"Outside intraday window. Allowed {INTRADAY_START_TIME}–{INTRADAY_CUTOFF_TIME} IST; "
+                f"current time is {india_now:%I:%M %p} IST."
+            )
+            ctx["warnings"].append(ctx["skip_reason"])
+        if ctx.get("nifty_trend") == "bearish":
+            ctx["skip_intraday"] = True
+            ctx["skip_reason"] = "Nifty is bearish — no new long intraday trades."
+            ctx["warnings"].append(ctx["skip_reason"])
+
+    safe_print(
+        f"VIX={ctx.get('vix','N/A')} | Nifty={ctx.get('nifty_trend')} | "
+        f"US={ctx.get('us_trend')} | IST={india_now:%H:%M}"
+    )
     for w in ctx.get("warnings", []):
         safe_print(f"  WARNING: {w}")
 
     lt_picks, intra_picks = fetch_and_score(ALL_TICKERS, ctx)
+
+    if EXECUTION_MODE == "PREMARKET":
+        intra_picks = []
+    elif EXECUTION_MODE == "INTRADAY":
+        lt_picks = []
+
     safe_print(f"\nPicks: {len(lt_picks)} long term, {len(intra_picks)} intraday")
 
     write_report(lt_picks, intra_picks, ctx)
-    safe_print(f"Report: {OUTPUT_FILE}")
-
     msgs = build_telegram_messages(lt_picks, intra_picks, ctx)
     send_telegram(msgs)
 
