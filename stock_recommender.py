@@ -1,14 +1,14 @@
 """
-Daily Stock Recommender — v6.2 (Maximum Accuracy)
+Daily Stock Recommender — v7.0 (Balanced Accuracy)
 ===================================================
-Screens Nifty 500 + key sector stocks every morning.
+Screens Nifty 500 + key sector stocks. Run PREMARKET for long-term and INTRADAY for live 5-minute setups.
 Sends recommendations to Telegram:
   - 2 Long Term picks  (hold 2 weeks to 3 months)
   - 3 Intraday picks   (exit same day before 3:15 PM)
 
 FILTERS USED
 -------------
-Pre-market : SGX Nifty trend, US markets (Dow/Nasdaq), India VIX
+Market     : Nifty trend, US markets (S&P 500 proxy), India VIX
 Sector     : Sector index health check before recommending any stock
 Technical  : 20/50/200 DMA, RSI, MACD, Bollinger Bands, ATR,
              Stochastic, ADX, OBV, VWAP, Supertrend, 52-week levels
@@ -48,9 +48,11 @@ REQUEST_PAUSE      = 0.5
 IST = ZoneInfo("Asia/Kolkata")
 OUTPUT_FILE        = f"recommendations_{datetime.now(IST):%Y-%m-%d}.md"
 
-# Strict confirmation requirements
+# Confirmation requirements
+# Long-term remains selective; intraday uses core filters + scored confirmations.
 MIN_LT_CONFIRMATIONS    = 4
-MIN_INTRA_CONFIRMATIONS = 6
+MIN_INTRA_CONFIRMATIONS = 5
+INTRADAY_MIN_SCORE      = 72
 
 # VIX thresholds
 VIX_NO_INTRADAY = 18   # Skip intraday completely
@@ -65,7 +67,7 @@ INTRADAY_INTERVAL = "5m"
 INTRADAY_PERIOD = "5d"
 INTRADAY_START_MINUTES = 15   # wait for first 15 minutes / opening range
 INTRADAY_MIN_BARS = 25
-INTRADAY_START_TIME = "09:35"
+INTRADAY_START_TIME = "09:40"
 INTRADAY_CUTOFF_TIME = "11:30"
 INTRADAY_MIN_TARGET_PCT = 0.75
 INTRADAY_MAX_RISK_PCT = 0.75
@@ -214,20 +216,9 @@ def get_market_context():
     except Exception:
         pass
 
-    # SGX Nifty proxy — use Nifty Futures or Gift Nifty
-    try:
-        sgx = yf.Ticker("^NSEI").history(period="2d")
-        if len(sgx) >= 2:
-            chg = (sgx["Close"].iloc[-1] - sgx["Close"].iloc[-2]) / sgx["Close"].iloc[-2] * 100
-            if chg > 0.2:
-                ctx["sgx_trend"] = "positive"
-            elif chg < -0.2:
-                ctx["sgx_trend"] = "negative"
-                ctx["warnings"].append("SGX Nifty negative — gap-down expected")
-            else:
-                ctx["sgx_trend"] = "flat"
-    except Exception:
-        pass
+    # SGX/GIFT Nifty: do not label Nifty itself as SGX/GIFT Nifty.
+    # We leave this as unavailable unless a dedicated futures data source is added.
+    ctx["sgx_trend"] = "unknown"
 
     # Sector health — last 3 days trend
     for sector, symbol in SECTOR_INDICES.items():
@@ -237,7 +228,14 @@ def get_market_context():
                 last3 = sec_df["Close"].tail(3)
                 positive_days = sum(1 for i in range(1, len(last3))
                                     if last3.iloc[i] > last3.iloc[i-1])
-                ctx["sector_health"][sector] = "bullish" if positive_days >= 2 else "bearish"
+                negative_days = sum(1 for i in range(1, len(last3))
+                                    if last3.iloc[i] < last3.iloc[i-1])
+                if positive_days >= 2:
+                    ctx["sector_health"][sector] = "bullish"
+                elif negative_days >= 2:
+                    ctx["sector_health"][sector] = "bearish"
+                else:
+                    ctx["sector_health"][sector] = "neutral"
             else:
                 ctx["sector_health"][sector] = "unknown"
         except Exception:
@@ -248,12 +246,19 @@ def get_market_context():
 
 
 def is_sector_healthy(ticker, ctx):
-    """Return True only when the mapped sector is confirmed supportive."""
+    """Sector is a supporting signal, not a hard gate."""
     sector = TICKER_SECTOR.get(ticker)
     if not sector:
-        return False  # No sector mapping = no intraday sector confirmation
+        return True
     health = ctx["sector_health"].get(sector, "unknown")
-    return health in {"bullish", "neutral"}
+    return health != "bearish"
+
+
+def sector_signal(ticker, ctx):
+    sector = TICKER_SECTOR.get(ticker)
+    if not sector:
+        return "unknown"
+    return ctx.get("sector_health", {}).get(sector, "unknown")
 
 
 # ─────────────────────────── INDICATORS ────────────────────────────────────
@@ -589,16 +594,18 @@ def compute_intraday_indicators(df):
 
 
 def score_intraday_5m(df, ctx):
-    """Score a conservative long intraday setup using actual 5-minute candles."""
+    """Balanced long intraday scorer using genuine 5-minute data.
+
+    Core filters: VWAP, EMA trend and participation.
+    Additional confirmations are scored instead of being mandatory.
+    This prevents a single missing signal from producing zero picks every day.
+    """
     if df is None or df.empty:
         return 0, 0, ["No intraday data"]
-
     if ctx.get("skip_intraday"):
-        return 0, 0, ["Intraday skipped by market/risk filter"]
+        return 0, 0, [ctx.get("skip_reason") or "Intraday skipped by market/risk filter"]
 
     row = df.iloc[-1]
-    score, confirmations, reasons = 0, 0, []
-
     price = float(row["Close"])
     vwap = row.get("VWAP")
     relvol = row.get("RelVolume")
@@ -606,19 +613,28 @@ def score_intraday_5m(df, ctx):
     atr = row.get("ATR")
     ema9 = row.get("EMA9")
     ema20 = row.get("EMA20")
+    macd = row.get("MACD")
+    macd_signal = row.get("MACD_Signal")
     opening_high = row.get("OpeningHigh")
 
-    # Market confirmation: bearish Nifty is a hard reject upstream; bullish is a bonus.
-    if ctx.get("nifty_trend") == "bullish":
-        score += 12
+    score = 0
+    confirmations = 0
+    reasons = []
+
+    # 1) Market regime: bullish helps, neutral is allowed, bearish is a penalty.
+    nifty = ctx.get("nifty_trend")
+    if nifty == "bullish":
+        score += 10
         confirmations += 1
         reasons.append("Nifty bullish — market supports long trades")
-    elif ctx.get("nifty_trend") == "neutral":
-        return 0, 0, ["Nifty neutral — no long intraday trade without market confirmation"]
-    else:
-        return 0, 0, ["Nifty bearish — long intraday trade rejected"]
+    elif nifty == "neutral":
+        score += 2
+        reasons.append("Nifty neutral — stock-level confirmation required")
+    elif nifty == "bearish":
+        score -= 8
+        reasons.append("Nifty bearish — extra caution on long trades")
 
-    # 1. Price vs session VWAP
+    # 2) VWAP — core requirement.
     if pd.notna(vwap) and price > vwap:
         score += 18
         confirmations += 1
@@ -626,50 +642,76 @@ def score_intraday_5m(df, ctx):
     else:
         return 0, 0, ["Price not above intraday VWAP"]
 
-    # 2. Short-term trend
+    # 3) EMA trend — core requirement.
     if pd.notna(ema9) and pd.notna(ema20) and ema9 > ema20 and price > ema9:
-        score += 16
+        score += 18
         confirmations += 1
         reasons.append("5-min EMA9 > EMA20 and price above EMA9")
     else:
         return 0, 0, ["5-min trend not bullish"]
 
-    # 3. Relative volume — require genuine participation
-    if pd.notna(relvol) and relvol >= 1.5:
+    # 4) Participation — core requirement, slightly less rigid than V6.
+    if pd.notna(relvol) and relvol >= 1.3:
         score += 18
         confirmations += 1
         reasons.append(f"Relative 5-min volume {relvol:.1f}x")
     else:
-        return 0, 0, ["Relative volume below 1.5x"]
+        return 0, 0, [f"Relative volume below 1.3x ({relvol:.1f}x)" if pd.notna(relvol) else "Relative volume unavailable"]
 
-    # 4. RSI — avoid chasing overbought candles
-    if pd.notna(rsi) and 50 <= rsi <= 68:
-        score += 14
+    # 5) RSI — confirmation, not a hard 68 ceiling.
+    if pd.notna(rsi) and 52 <= rsi <= 68:
+        score += 12
         confirmations += 1
         reasons.append(f"5-min RSI {rsi:.0f} — bullish momentum zone")
-    elif pd.notna(rsi) and rsi > 68:
-        return 0, 0, [f"5-min RSI {rsi:.0f} — too extended"]
+    elif pd.notna(rsi) and 68 < rsi <= 72:
+        score += 5
+        reasons.append(f"5-min RSI {rsi:.0f} — strong but extended")
+    elif pd.notna(rsi) and rsi > 72:
+        score -= 8
+        reasons.append(f"5-min RSI {rsi:.0f} — overextended")
     else:
-        return 0, 0, ["5-min RSI lacks bullish confirmation"]
+        score -= 3
 
-    # 5. Opening-range breakout
+    # 6) Opening range breakout — bonus rather than mandatory.
     if pd.notna(opening_high) and price > opening_high:
-        score += 18
+        score += 14
         confirmations += 1
         reasons.append("Breakout above first 15-minute high")
-    else:
-        return 0, 0, ["No first-15-minute breakout"]
 
-    # 6. Tradable 5-minute volatility
+    # 7) MACD confirmation.
+    if pd.notna(macd) and pd.notna(macd_signal) and macd > macd_signal:
+        score += 8
+        confirmations += 1
+        reasons.append("5-min MACD bullish")
+
+    # 8) Tradable volatility.
     atr_pct = (atr / price * 100) if pd.notna(atr) and price else 0
     if 0.15 <= atr_pct <= 0.75:
-        score += 10
+        score += 8
         confirmations += 1
         reasons.append(f"5-min ATR {atr_pct:.2f}% — tradable range")
     elif atr_pct > 0.75:
         return 0, 0, [f"5-min ATR {atr_pct:.2f}% — too volatile"]
     else:
-        return 0, 0, [f"5-min ATR {atr_pct:.2f}% — too small for intraday"]
+        score -= 4
+        reasons.append(f"5-min ATR {atr_pct:.2f}% — low movement")
+
+    # 9) Sector context is a bonus/penalty, never a hard gate.
+    sector = TICKER_SECTOR.get(df.attrs.get("ticker", ""))
+    if sector:
+        health = ctx.get("sector_health", {}).get(sector, "unknown")
+        if health == "bullish":
+            score += 5
+            confirmations += 1
+            reasons.append(f"{sector} sector bullish")
+        elif health == "bearish":
+            score -= 4
+            reasons.append(f"{sector} sector bearish — caution")
+
+    # Bearish Nifty requires one extra confirmation; neutral does not block.
+    min_conf = MIN_INTRA_CONFIRMATIONS + (1 if nifty == "bearish" else 0)
+    if confirmations < min_conf:
+        return score, confirmations, reasons + [f"Need {min_conf} confirmations; got {confirmations}"]
 
     return score, confirmations, reasons
 
@@ -709,7 +751,13 @@ def fetch_and_score(tickers, ctx):
 
             # Long term
             lt_score, lt_conf, lt_reasons = score_longterm(df, row, info)
-            if lt_score >= 55 and lt_conf >= MIN_LT_CONFIRMATIONS and sector_ok:
+            if sector_ok:
+                lt_score += 3
+                lt_reasons.append(f"Sector supportive ({sector_signal(ticker, ctx)})")
+            elif sector_signal(ticker, ctx) == "bearish":
+                lt_score -= 5
+                lt_reasons.append("Sector bearish — caution")
+            if lt_score >= 55 and lt_conf >= MIN_LT_CONFIRMATIONS:
                 sl  = round(price - 2.0 * atr, 2)
                 tgt = round(price + MIN_RR_LONGTERM * (price - sl), 2)
                 rr  = round((tgt - price) / (price - sl), 1)
@@ -724,10 +772,11 @@ def fetch_and_score(tickers, ctx):
                     })
 
             # Intraday — only during the approved morning window, using actual 5-minute candles.
-            if not ctx.get("skip_intraday") and sector_ok:
+            if not ctx.get("skip_intraday"):
                 intra_df = fetch_intraday_data(ticker)
                 if intra_df is not None:
                     intra_df = compute_intraday_indicators(intra_df)
+                    intra_df.attrs["ticker"] = ticker
 
                     # Never create a new intraday trade after the configured cutoff.
                     last_ts = intra_df.index[-1]
@@ -738,7 +787,7 @@ def fetch_and_score(tickers, ctx):
 
                     in_score, in_conf, in_reasons = score_intraday_5m(intra_df, ctx)
 
-                    if in_score >= 90 and in_conf >= max(6, MIN_INTRA_CONFIRMATIONS):
+                    if in_score >= INTRADAY_MIN_SCORE and in_conf >= MIN_INTRA_CONFIRMATIONS:
                         intra_row = intra_df.iloc[-1]
                         intra_price = float(intra_row["Close"])
                         intra_atr = float(intra_row["ATR"]) if pd.notna(intra_row["ATR"]) else intra_price * 0.003
@@ -859,7 +908,7 @@ def build_telegram_messages(lt_picks, intra_picks, ctx):
             f"Reason: {reason}"
         )
     else:
-        messages.append("INTRADAY PICKS (V6 | 5-min confirmation | Exit before 3:15 PM)")
+        messages.append("INTRADAY PICKS (V7 | 5-min confirmation | Exit before 3:15 PM)")
         if not intra_picks:
             messages.append(
                 "No high-probability intraday setups today.\n"
@@ -971,7 +1020,7 @@ def safe_print(text):
 
 def run():
     safe_print("=" * 50)
-    safe_print(f"Daily Stock Recommender v6.2 - {datetime.now(IST):%d %b %Y %I:%M %p IST}")
+    safe_print(f"Daily Stock Recommender v7.0 - {datetime.now(IST):%d %b %Y %I:%M %p IST}")
     safe_print(f"Execution mode: {EXECUTION_MODE}")
     safe_print("=" * 50)
 
@@ -992,10 +1041,6 @@ def run():
                 f"current time is {india_now:%I:%M %p} IST."
             )
             ctx["warnings"].append(ctx["skip_reason"])
-        if ctx.get("nifty_trend") == "bearish":
-            ctx["skip_intraday"] = True
-            ctx["skip_reason"] = "Nifty is bearish — no new long intraday trades."
-            ctx["warnings"].append(ctx["skip_reason"])
 
     else:
         if not in_window:
@@ -1004,10 +1049,6 @@ def run():
                 f"Outside intraday window. Allowed {INTRADAY_START_TIME}–{INTRADAY_CUTOFF_TIME} IST; "
                 f"current time is {india_now:%I:%M %p} IST."
             )
-            ctx["warnings"].append(ctx["skip_reason"])
-        if ctx.get("nifty_trend") == "bearish":
-            ctx["skip_intraday"] = True
-            ctx["skip_reason"] = "Nifty is bearish — no new long intraday trades."
             ctx["warnings"].append(ctx["skip_reason"])
 
     safe_print(
