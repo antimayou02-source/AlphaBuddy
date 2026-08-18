@@ -2,8 +2,8 @@ name: Daily Stock Recommender - Long Term
 
 on:
   schedule:
-    # 08:30 IST = 03:00 UTC (GitHub Actions cron uses UTC)
-    - cron: '0 3 * * 1-5'
+    # 08:15 IST = 02:45 UTC
+    - cron: '45 2 * * 1-5'
   workflow_dispatch:
 
 jobs:
