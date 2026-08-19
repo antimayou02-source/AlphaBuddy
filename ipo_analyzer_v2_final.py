@@ -398,7 +398,6 @@ def analyze():
     raw = fetch_nse_ipo_data()
     ipos = [normalize_ipo(x) for x in raw]
 
-    # Closing-day-only policy:
     # Analyze IPOs only when their official close date is TODAY.
     closing_today = [
         ipo for ipo in ipos
@@ -557,8 +556,6 @@ def main():
     results = analyze()
 
     # Always send a Telegram status message.
-    # On a closing day, this is the full analysis.
-    # Otherwise, it is the short "No IPO closing today" message.
     if not results:
         messages = build_messages([])
         send_telegram(messages)
