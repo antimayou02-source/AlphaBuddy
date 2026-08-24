@@ -2,8 +2,8 @@ name: Daily Stock Recommender - Long Term
 
 on:
   schedule:
-    # 08:15 IST = 02:45 UTC
-    - cron: '45 2 * * 1-5'
+    # 08:30 IST = 03:00 UTC
+    - cron: '0 3 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -12,15 +12,12 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: pip install yfinance feedparser pandas numpy requests
-
       - name: Run long-term recommender
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
