@@ -1,5 +1,5 @@
 """
-IPO Analyzer V2
+IPO Analyzer V3
 ================
 Runs at 2:00 PM IST and sends a Telegram summary of:
 - IPOs closing today
@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import time
+from urllib.parse import quote, urljoin
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -175,83 +176,194 @@ def normalize_ipo(raw):
 
 
 
-def google_search_text(query):
-    """Return Google result-page text for a targeted IPO fact lookup."""
+
+def google_search_html(query):
+    """Fetch a Google result page. Used only to discover public source URLs."""
     try:
-        url = "https://www.google.com/search?q=" + requests.utils.quote(query)
+        url = "https://www.google.com/search?q=" + quote(query)
         r = session.get(url, timeout=REQUEST_TIMEOUT)
         if r.ok:
-            return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", r.text))
+            return html.unescape(r.text)
     except Exception as e:
-        print(f"  ! Web lookup failed: {e}")
+        print(f"  ! Search lookup failed: {e}")
     return ""
+
+
+def strip_html(value):
+    value = html.unescape(value or "")
+    value = re.sub(r"<script.*?</script>", " ", value, flags=re.I | re.S)
+    value = re.sub(r"<style.*?</style>", " ", value, flags=re.I | re.S)
+    value = re.sub(r"<[^>]+>", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def discover_source_urls(name):
+    """
+    Discover direct public IPO pages from established IPO-information sources.
+    The search page is only used to locate the source; values are parsed from
+    the source page itself.
+    """
+    queries = [
+        f'site:zerodha.com/ipo/ "{name}" IPO',
+        f'site:indmoney.com/ipo/ "{name}" IPO',
+        f'site:livemint.com/market/ipo/ "{name}" IPO',
+        f'site:kotakneo.com/ipo/ "{name}" IPO',
+        f'site:ipostation.in/ipo/ "{name}" IPO',
+    ]
+    urls = []
+    patterns = [
+        r'https?://(?:www\.)?zerodha\.com/ipo/[^\s"<>\\]+',
+        r'https?://(?:www\.)?indmoney\.com/ipo/[^\s"<>\\]+',
+        r'https?://(?:www\.)?livemint\.com/market/ipo/[^\s"<>\\]+',
+        r'https?://(?:www\.)?kotakneo\.com/ipo/[^\s"<>\\]+',
+        r'https?://(?:www\.)?ipostation\.in/ipo/[^\s"<>\\]+',
+    ]
+    for q in queries:
+        page = google_search_html(q)
+        for pat in patterns:
+            for u in re.findall(pat, page, flags=re.I):
+                u = u.rstrip(")&'\\")
+                if u not in urls:
+                    urls.append(u)
+    return urls[:8]
+
+
+def fetch_source_text(url):
+    try:
+        r = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        if r.ok and len(r.text) > 500:
+            return strip_html(r.text), r.url
+    except Exception as e:
+        print(f"  ! Source page failed {url}: {e}")
+    return "", url
+
+
+def parse_source_facts(ipo, text):
+    """Parse common IPO facts/subscription figures from a source page."""
+    if not text:
+        return ipo
+
+    # Price band
+    if ipo.get("price_low") is None or ipo.get("price_high") is None:
+        patterns = [
+            r'(?:price range|price band)[^₹0-9]{0,50}₹?\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:-|–|to)\s*₹?\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
+            r'₹\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*[–-]\s*₹\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
+        ]
+        for pat in patterns:
+            m = re.search(pat, text, re.I)
+            if m:
+                ipo["price_low"] = float(m.group(1).replace(",", ""))
+                ipo["price_high"] = float(m.group(2).replace(",", ""))
+                break
+
+    # Lot size
+    if ipo.get("lot_size") is None:
+        for pat in [
+            r'lot size[^0-9]{0,30}([0-9]{1,5})\s*(?:shares?)?',
+            r'minimum investment[^0-9]{0,30}[₹]?\s*[0-9,]+\s*/\s*([0-9]{1,5})\s*shares?',
+        ]:
+            m = re.search(pat, text, re.I)
+            if m:
+                ipo["lot_size"] = float(m.group(1))
+                break
+
+    # Issue size
+    if ipo.get("issue_size") is None:
+        for pat in [
+            r'(?:total issue size|issue size|funds raised)[^₹0-9]{0,40}(?:₹|Rs\.?|INR)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:cr|crore)',
+        ]:
+            m = re.search(pat, text, re.I)
+            if m:
+                ipo["issue_size"] = float(m.group(1).replace(",", ""))
+                break
+
+    # Subscription values. These patterns work with both prose and table text.
+    sub_patterns = {
+        "qib": [
+            r'(?:institutional|QIB|qualified institutional buyers?)[^0-9]{0,80}([0-9]+(?:\.[0-9]+)?)\s*x',
+        ],
+        "nii": [
+            r'(?:NII|non[- ]institutional investors?|HNI)[^0-9]{0,80}([0-9]+(?:\.[0-9]+)?)\s*x',
+        ],
+        "retail": [
+            r'(?:retail(?: individual investors?)?|RII)[^0-9]{0,80}([0-9]+(?:\.[0-9]+)?)\s*x',
+        ],
+        "total": [
+            r'(?:total|overall)[^0-9]{0,80}([0-9]+(?:\.[0-9]+)?)\s*x',
+        ],
+    }
+    for key, pats in sub_patterns.items():
+        if ipo.get(key) is None:
+            for pat in pats:
+                m = re.search(pat, text, re.I)
+                if m:
+                    ipo[key] = float(m.group(1))
+                    break
+
+    # GMP: only from explicit GMP wording; never treat generic numbers as GMP.
+    if ipo.get("gmp") is None:
+        for pat in [
+            r'(?:grey market premium|GMP)[^₹0-9]{0,40}(?:₹|Rs\.?|INR)?\s*([0-9]+(?:\.[0-9]+)?)',
+        ]:
+            m = re.search(pat, text, re.I)
+            if m:
+                ipo["gmp"] = float(m.group(1))
+                ipo["gmp_source"] = "External IPO source (unofficial GMP)"
+                break
+
+    return ipo
+
+
+def google_search_text(query):
+    return strip_html(google_search_html(query))
 
 
 def enrich_from_web(ipo):
     """
-    Fill missing IPO facts from targeted web-search snippets.
-    Official/NSE data remains preferred; web values are used only when
-    the NSE payload is missing a field. GMP is always unofficial.
+    Fill missing fields from direct public IPO pages discovered via search.
+    Official NSE data remains preferred. Secondary pages are used only to
+    fill fields absent from the NSE payload. GMP is always unofficial.
     """
-    name = ipo["name"]
+    today = datetime.now(IST).date()
+    date_text = today.strftime("%d %B %Y")
+    urls = discover_source_urls(ipo["name"])
 
-    # 1) Issue facts: price band, lot size, issue size.
-    if any(ipo.get(k) is None for k in ("price_low", "price_high", "lot_size", "issue_size")):
+    # Prefer Zerodha/IndMoney/Livemint/KotakNeo pages because they publish
+    # structured issue and subscription tables.
+    for url in urls:
+        text, final_url = fetch_source_text(url)
+        if not text:
+            continue
+        before = tuple(ipo.get(k) for k in
+                       ("price_low","price_high","lot_size","issue_size","qib","nii","retail","total","gmp"))
+        parse_source_facts(ipo, text)
+        after = tuple(ipo.get(k) for k in
+                      ("price_low","price_high","lot_size","issue_size","qib","nii","retail","total","gmp"))
+        if after != before:
+            print(f"  + Enriched from {final_url}")
+
+        # Stop once all core issue/subscription fields are available.
+        core = ("price_low","price_high","lot_size","issue_size","qib","nii","retail","total")
+        if all(ipo.get(k) is not None for k in core):
+            break
+
+    # A second targeted search can still help when a source page was not
+    # discoverable. It uses today's date rather than a hard-coded date.
+    missing_core = [k for k in
+                    ("price_low","price_high","lot_size","issue_size","qib","nii","retail","total")
+                    if ipo.get(k) is None]
+    if missing_core:
         s = google_search_text(
-            f'"{name}" IPO price band lot size issue size 2026'
+            f'"{ipo["name"]}" IPO {date_text} price band lot size subscription QIB NII retail total'
         )
-        if ipo.get("price_low") is None or ipo.get("price_high") is None:
-            m = re.search(r'(?:price band|price range)[^₹\d]{0,40}₹?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:-|to|–)\s*₹?\s*([0-9]+(?:\.[0-9]+)?)', s, re.I)
-            if m:
-                ipo["price_low"], ipo["price_high"] = float(m.group(1)), float(m.group(2))
-        if ipo.get("lot_size") is None:
-            m = re.search(r'(?:lot size|minimum bid)[^0-9]{0,40}([0-9]{1,5})\s*(?:shares?)?', s, re.I)
-            if m:
-                ipo["lot_size"] = float(m.group(1))
-        if ipo.get("issue_size") is None:
-            m = re.search(r'(?:issue size|raises?)\s*(?:of\s*)?(?:₹|rs\.?)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:crore|cr\b)', s, re.I)
-            if m:
-                ipo["issue_size"] = float(m.group(1))
+        parse_source_facts(ipo, s)
 
-    # 2) Closing-day subscription. Use a targeted query so snippets are about
-    # this IPO rather than generic market results.
-    if any(ipo.get(k) is None for k in ("qib", "nii", "retail", "total")):
-        s = google_search_text(
-            f'"{name}" IPO final subscription QIB NII retail total 25 August 2026'
-        )
-        patterns = {
-            "qib": [
-                r'(?:QIB|qualified institutional buyers?)[^\d]{0,30}([0-9]+(?:\.[0-9]+)?)\s*x',
-            ],
-            "nii": [
-                r'(?:NII|HNI|non[- ]institutional)[^\d]{0,35}([0-9]+(?:\.[0-9]+)?)\s*x',
-            ],
-            "retail": [
-                r'(?:retail|RII)[^\d]{0,35}([0-9]+(?:\.[0-9]+)?)\s*x',
-            ],
-            "total": [
-                r'(?:overall|total)[^\d]{0,35}([0-9]+(?:\.[0-9]+)?)\s*x',
-                r'subscribed\s+([0-9]+(?:\.[0-9]+)?)\s*x',
-            ],
-        }
-        for key, pats in patterns.items():
-            if ipo.get(key) is None:
-                for pat in pats:
-                    m = re.search(pat, s, re.I)
-                    if m:
-                        ipo[key] = float(m.group(1))
-                        break
-
-    # 3) GMP. This is explicitly unofficial and is kept separate from NSE facts.
+    # GMP is separate and unofficial.
     if ipo.get("gmp") is None:
-        s = google_search_text(f'"{name}" IPO GMP 25 August 2026')
-        m = re.search(r'(?:GMP|grey market premium)[^₹\d]{0,35}(?:₹|Rs\.?|INR)?\s*([0-9]+(?:\.[0-9]+)?)', s, re.I)
-        if m:
-            ipo["gmp"] = float(m.group(1))
-            ipo["gmp_source"] = "External web search (unofficial GMP)"
+        s = google_search_text(f'"{ipo["name"]}" IPO GMP {date_text}')
+        parse_source_facts(ipo, s)
 
     return ipo
-
 
 def next_working_day(day):
     d = day + pd.Timedelta(days=1)
@@ -525,6 +637,7 @@ def build_messages(results):
         "=" * 32,
         "Official issue/subscription facts: NSE/official data",
         "GMP: unofficial external grey-market signal",
+        "Secondary IPO pages are used only to fill fields missing from NSE.",
         "",
     ]
 
@@ -560,7 +673,7 @@ def build_messages(results):
                 "─" * 30,
                 f"Close      : {close_text}",
                 f"Price Band : {price_text}",
-                f"Lot Size   : {ipo['lot_size'] or 'N/A'}",
+                f"Lot Size   : {int(ipo['lot_size']) if ipo.get('lot_size') is not None and float(ipo['lot_size']).is_integer() else ipo.get('lot_size') or 'N/A'}",
                 f"QIB        : {format_sub(ipo['qib'])}",
                 f"NII/HNI    : {format_sub(ipo['nii'])}",
                 f"Retail     : {format_sub(ipo['retail'])}",
@@ -636,7 +749,7 @@ def write_report(results):
 
 def main():
     print("=" * 50)
-    print(f"IPO Analyzer V2 — {datetime.now(IST):%d %b %Y %H:%M IST}")
+    print(f"IPO Analyzer V3 — {datetime.now(IST):%d %b %Y %H:%M IST}")
     print("=" * 50)
 
     results = analyze()
