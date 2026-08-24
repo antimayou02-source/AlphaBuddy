@@ -174,6 +174,85 @@ def normalize_ipo(raw):
     }
 
 
+
+def google_search_text(query):
+    """Return Google result-page text for a targeted IPO fact lookup."""
+    try:
+        url = "https://www.google.com/search?q=" + requests.utils.quote(query)
+        r = session.get(url, timeout=REQUEST_TIMEOUT)
+        if r.ok:
+            return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", r.text))
+    except Exception as e:
+        print(f"  ! Web lookup failed: {e}")
+    return ""
+
+
+def enrich_from_web(ipo):
+    """
+    Fill missing IPO facts from targeted web-search snippets.
+    Official/NSE data remains preferred; web values are used only when
+    the NSE payload is missing a field. GMP is always unofficial.
+    """
+    name = ipo["name"]
+
+    # 1) Issue facts: price band, lot size, issue size.
+    if any(ipo.get(k) is None for k in ("price_low", "price_high", "lot_size", "issue_size")):
+        s = google_search_text(
+            f'"{name}" IPO price band lot size issue size 2026'
+        )
+        if ipo.get("price_low") is None or ipo.get("price_high") is None:
+            m = re.search(r'(?:price band|price range)[^₹\d]{0,40}₹?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:-|to|–)\s*₹?\s*([0-9]+(?:\.[0-9]+)?)', s, re.I)
+            if m:
+                ipo["price_low"], ipo["price_high"] = float(m.group(1)), float(m.group(2))
+        if ipo.get("lot_size") is None:
+            m = re.search(r'(?:lot size|minimum bid)[^0-9]{0,40}([0-9]{1,5})\s*(?:shares?)?', s, re.I)
+            if m:
+                ipo["lot_size"] = float(m.group(1))
+        if ipo.get("issue_size") is None:
+            m = re.search(r'(?:issue size|raises?)\s*(?:of\s*)?(?:₹|rs\.?)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:crore|cr\b)', s, re.I)
+            if m:
+                ipo["issue_size"] = float(m.group(1))
+
+    # 2) Closing-day subscription. Use a targeted query so snippets are about
+    # this IPO rather than generic market results.
+    if any(ipo.get(k) is None for k in ("qib", "nii", "retail", "total")):
+        s = google_search_text(
+            f'"{name}" IPO final subscription QIB NII retail total 25 August 2026'
+        )
+        patterns = {
+            "qib": [
+                r'(?:QIB|qualified institutional buyers?)[^\d]{0,30}([0-9]+(?:\.[0-9]+)?)\s*x',
+            ],
+            "nii": [
+                r'(?:NII|HNI|non[- ]institutional)[^\d]{0,35}([0-9]+(?:\.[0-9]+)?)\s*x',
+            ],
+            "retail": [
+                r'(?:retail|RII)[^\d]{0,35}([0-9]+(?:\.[0-9]+)?)\s*x',
+            ],
+            "total": [
+                r'(?:overall|total)[^\d]{0,35}([0-9]+(?:\.[0-9]+)?)\s*x',
+                r'subscribed\s+([0-9]+(?:\.[0-9]+)?)\s*x',
+            ],
+        }
+        for key, pats in patterns.items():
+            if ipo.get(key) is None:
+                for pat in pats:
+                    m = re.search(pat, s, re.I)
+                    if m:
+                        ipo[key] = float(m.group(1))
+                        break
+
+    # 3) GMP. This is explicitly unofficial and is kept separate from NSE facts.
+    if ipo.get("gmp") is None:
+        s = google_search_text(f'"{name}" IPO GMP 25 August 2026')
+        m = re.search(r'(?:GMP|grey market premium)[^₹\d]{0,35}(?:₹|Rs\.?|INR)?\s*([0-9]+(?:\.[0-9]+)?)', s, re.I)
+        if m:
+            ipo["gmp"] = float(m.group(1))
+            ipo["gmp_source"] = "External web search (unofficial GMP)"
+
+    return ipo
+
+
 def next_working_day(day):
     d = day + pd.Timedelta(days=1)
     while d.weekday() >= 5:
@@ -367,7 +446,7 @@ def score_ipo(ipo):
     # V2 is conservative when key demand/GMP data is missing.
     known = sum(x is not None for x in (qib, nii, retail, total, gmp_pct))
     if known < 3:
-        return min(score, 59), reasons + ["Insufficient verified data"]
+        return None, reasons + ["Insufficient verified data — no recommendation"]
 
     score = min(score, 100)
 
@@ -382,6 +461,8 @@ def score_ipo(ipo):
 
 
 def action_from_score(score):
+    if score is None:
+        return "⚪ INSUFFICIENT DATA"
     if score >= 70:
         return "🟢 APPLY"
     if score >= 50:
@@ -412,9 +493,14 @@ def analyze():
 
     results = []
     for ipo in closing_today:
-        gmp_info = fetch_gmp(ipo["name"])
-        ipo["gmp"] = gmp_info["gmp"]
-        ipo["gmp_source"] = gmp_info["source"]
+        ipo = enrich_from_web(ipo)
+
+        if ipo.get("gmp") is None:
+            gmp_info = fetch_gmp(ipo["name"])
+            ipo["gmp"] = gmp_info["gmp"]
+            ipo["gmp_source"] = gmp_info["source"]
+        elif not ipo.get("gmp_source"):
+            ipo["gmp_source"] = "External web search (unofficial GMP)"
 
         listing, gain_pct = estimate_listing(ipo)
         ipo["estimated_listing"] = listing
@@ -486,7 +572,7 @@ def build_messages(results):
                 f"Profit     : {ipo.get('profit_growth'):.1f}%" if ipo.get('profit_growth') is not None else "Profit     : N/A",
                 f"P/E        : {ipo.get('pe'):.1f}" if ipo.get('pe') is not None else "P/E        : N/A",
                 f"Debt/Equity: {ipo.get('debt_equity'):.2f}" if ipo.get('debt_equity') is not None else "Debt/Equity: N/A",
-                f"IPO Score  : {ipo['score']}/100",
+                f"IPO Score  : {ipo['score']}/100" if ipo['score'] is not None else "IPO Score  : N/A",
                 "Why:",
             ]
             lines += [f"  * {r}" for r in ipo["reasons"][:5]]
