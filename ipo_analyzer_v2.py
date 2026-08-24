@@ -1,5 +1,5 @@
 """
-IPO Analyzer V3
+IPO Analyzer V4
 ================
 Runs at 2:00 PM IST and sends a Telegram summary of:
 - IPOs closing today
@@ -17,6 +17,7 @@ IMPORTANT:
 
 import os
 import re
+import html
 import sys
 import time
 from urllib.parse import quote, urljoin
@@ -749,7 +750,7 @@ def write_report(results):
 
 def main():
     print("=" * 50)
-    print(f"IPO Analyzer V3 — {datetime.now(IST):%d %b %Y %H:%M IST}")
+    print(f"IPO Analyzer V4 — {datetime.now(IST):%d %b %Y %H:%M IST}")
     print("=" * 50)
 
     results = analyze()
