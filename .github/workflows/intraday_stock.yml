@@ -24,4 +24,4 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           STOCK_RECOMMENDER_MODE: INTRADAY
-        run: python stock_recommender_v7.py
+        run: python stock_recommender_v8.py
